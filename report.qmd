@@ -1,0 +1,123 @@
+---
+title: "Fast Health Micro-simulation: Vectorized Core + Uncertainty"
+subtitle: "A reproducible showcase on synthetic data"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    code-fold: show
+    fig-width: 8
+    fig-height: 5
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## What this is
+
+A compact, fully reproducible demo of a health micro-simulation whose compute
+core was re-written for speed, plus an uncertainty layer. Everything here runs
+on **synthetic data** and uses **base R only**.
+
+The story in three steps: (1) a readable but slow engine, (2) a vectorized
+engine that is ~100–300× faster and gives **identical** results, and (3) a
+Latin-Hypercube/PSA layer that turns point estimates into credible intervals.
+
+```{r setup}
+source("R/simulate_data.R")
+source("R/engine_naive.R")
+source("R/engine_fast.R")
+source("R/psa.R")
+```
+
+## The model
+
+A synthetic population steps through yearly cycles. Each individual carries a
+per-disease exposure relative risk; baseline incidence/mortality rates depend on
+age and sex; a few comorbidities raise the risk of other diseases. Every
+transition uses
+
+$$ p = 1 - \exp\!\big(-(\text{rate}\times \text{exposure RR}\times \text{comorbidity RR})\big). $$
+
+```{r peek}
+inp <- make_inputs(n = 2000, n_cycles = 10, seed = 42)
+str(inp$pop[1:3, ])
+inp$comorb
+```
+
+## Speed: naive vs vectorized
+
+```{r bench}
+sizes <- c(500, 1000, 2000)
+tab <- data.frame(n = sizes, naive_s = NA, fast_s = NA)
+for (k in seq_along(sizes)) {
+  i <- make_inputs(sizes[k], 8, seed = 42)
+  tab$naive_s[k] <- system.time(run_engine_naive(i, 1))[["elapsed"]]
+  tab$fast_s[k]  <- system.time(run_engine_fast(i, 1))[["elapsed"]]
+}
+tab$speedup <- round(tab$naive_s / tab$fast_s)
+knitr::kable(tab, caption = "Runtime (seconds) and speedup by population size")
+```
+
+```{r bench-plot, fig.cap="Runtime vs population size (log scale)."}
+plot(tab$n, tab$naive_s, log = "y", type = "b", pch = 19, col = "#D1495B", lwd = 2,
+     ylim = range(c(tab$fast_s, tab$naive_s)), las = 1,
+     xlab = "Population size", ylab = "Runtime per run (s, log)")
+lines(tab$n, tab$fast_s, type = "b", pch = 19, col = "#2A9D8F", lwd = 2)
+legend("right", c("naive", "vectorized"), col = c("#D1495B", "#2A9D8F"), lwd = 2, bty = "n")
+```
+
+## Equivalence: the two engines agree exactly
+
+Because both engines consume the random stream in the same order, their outputs
+are **bit-identical**, not just close.
+
+```{r equiv}
+i  <- make_inputs(3000, 20, seed = 7)
+rn <- run_engine_naive(i, seed = 123)
+rf <- run_engine_fast(i,  seed = 123)
+cat("max |naive - fast| over all cycles/diseases:",
+    max(abs(rn$prevalence - rf$prevalence)), "\n")
+```
+
+```{r equiv-plot, fig.cap="Prevalence trajectories: thick = naive, thin white = vectorized."}
+show <- c("diabetes", "heart_disease", "stroke"); cols <- c("#264653","#E76F51","#2A9D8F")
+matplot(rn$prevalence[, show], type = "l", lwd = 5, lty = 1, col = cols, las = 1,
+        xlab = "Cycle", ylab = "Prevalent cases")
+matlines(rf$prevalence[, show], lwd = 1.4, lty = 1, col = "white")
+legend("bottomright", show, col = cols, lwd = 4, bty = "n")
+```
+
+## Uncertainty: LHS + PSA
+
+```{r psa}
+inp   <- make_inputs(n = 4000, n_cycles = 20, seed = 42)
+cb_ci <- default_comorb_ci()
+psa   <- run_psa(inp, cb_ci, n_draws = 100, seed = 1, progress = FALSE)
+summ  <- summarise_psa(psa)
+s <- summ[summ$disease == "heart_disease", ]
+```
+
+```{r psa-plot, fig.cap="Median and 95% credible band for heart disease prevalence."}
+plot(s$cycle, s$median, type = "n", ylim = range(c(s$lo95, s$hi95)), las = 1,
+     xlab = "Cycle", ylab = "Prevalent cases (heart disease)")
+polygon(c(s$cycle, rev(s$cycle)), c(s$lo95, rev(s$hi95)), col = "#9AD1C9", border = NA)
+lines(s$cycle, s$median, col = "#2A9D8F", lwd = 3)
+```
+
+```{r psa-table}
+final <- summ[summ$cycle == inp$n_cycles, ]
+final$rel_width <- round((final$hi95 - final$lo95) / final$median, 2)
+knitr::kable(final, row.names = FALSE, digits = 0,
+             caption = "Final-cycle prevalence: median and 95% credible interval")
+```
+
+## Takeaways
+
+- The optimization is a **representation change** (string state → logical
+  matrix) plus **vectorization** (per-person loops → whole-column ops): large
+  speedups with **no change in results**.
+- The **PSA/LHS** layer propagates input uncertainty to the outputs, which is
+  what makes results reportable with credible intervals.
+- All of it is reproducible from synthetic data with base R.
